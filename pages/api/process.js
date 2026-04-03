@@ -1,12 +1,7 @@
 import bodyParser from "body-parser";
 import OpenAI from "openai";
 import twilio from "twilio";
-import {
-  addTurn,
-  buildOpenAIInput,
-  getConversation,
-  getTranscript,
-} from "../../lib/memory";
+import { addTurn, getTranscript } from "../../lib/memory";
 import {
   extractLeadDetails,
   getLead,
@@ -23,8 +18,49 @@ const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN,
 );
-const SYSTEM_PROMPT =
-  "You are a premium mold inspection intake assistant.\n\nYou are in an ongoing phone conversation and must remember everything the caller already shared.\n\nYour job is to continue the intake calmly and professionally until the caller's name and property address are collected.\n\nGuide this exact flow without skipping or repeating completed steps:\n1. Issue\n2. Property type\n3. Size\n4. Urgency\n5. Price anchor ($400-$900)\n6. Close\n7. Name\n8. Address\n\nRules:\n- Never repeat questions that were already answered\n- Always ask the NEXT missing step\n- Ask only one question at a time\n- Keep responses under 2 sentences\n- If the caller gives a short or vague answer, ask a brief follow-up that advances the current step\n- Never say you are connecting the caller to a specialist\n- Never suggest ending the call early\n- Never end the conversation before both name and address are collected\n- Sound professional and confident\n- Never diagnose mold\n- Never give remediation advice\n\nRequired wording near the end:\n- After collecting the intake details but before name/address, say: \"A typical inspection ranges between $400 and $900 depending on the scope.\"\n- Then say: \"I can have a specialist reach out, or schedule a visit - what works best for you?\"\n- Then collect the name and address if missing\n- Once both are collected, say exactly: \"Perfect - we'll have someone reach out shortly.\"\n- After that confirmation, if the caller keeps talking, acknowledge briefly and repeat that someone will reach out shortly without restarting intake";
+const ACK_SYSTEM_PROMPT =
+  "You write short, calm, professional acknowledgement lines for a premium mold inspection phone intake agent. Return one sentence only, no questions, no diagnosis, no remediation advice, and no transfer language.";
+const callStates = new Map();
+
+function getCallState(callSid) {
+  if (!callSid) {
+    return {
+      step: "issue",
+      updatedAt: Date.now(),
+    };
+  }
+
+  const existing = callStates.get(callSid);
+
+  if (existing) {
+    existing.updatedAt = Date.now();
+    return existing;
+  }
+
+  const created = {
+    step: "issue",
+    updatedAt: Date.now(),
+  };
+
+  callStates.set(callSid, created);
+  return created;
+}
+
+function setCallStep(callSid, nextStep) {
+  const state = getCallState(callSid);
+  const previousStep = state.step;
+
+  state.step = nextStep;
+  state.updatedAt = Date.now();
+
+  console.log("[flow] step change", {
+    callSid,
+    from: previousStep,
+    to: nextStep,
+  });
+
+  return state;
+}
 
 function runMiddleware(req, res, middleware) {
   return new Promise((resolve, reject) => {
@@ -49,16 +85,37 @@ function buildGather(response, prompt) {
   gather.say(prompt);
 }
 
-async function generateReply(callSid, speechResult) {
-  const response = await openai.responses.create({
-    model: "gpt-4o-mini",
-    input: buildOpenAIInput(callSid, SYSTEM_PROMPT, speechResult),
-  });
+async function generateAcknowledgement(step, speechResult) {
+  try {
+    const response = await openai.responses.create({
+      model: "gpt-4o-mini",
+      input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text: ACK_SYSTEM_PROMPT,
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `Current intake step: ${step}. Caller said: "${speechResult}".`,
+            },
+          ],
+        },
+      ],
+    });
 
-  return (
-    response.output_text?.trim() ||
-    "Could you tell me a bit more so I can keep the intake moving?"
-  );
+    return response.output_text?.trim() || "";
+  } catch (error) {
+    console.error("[openai] acknowledgement failed", error?.message || error);
+    return "";
+  }
 }
 
 function normalizePhoneNumber(phone) {
@@ -110,7 +167,7 @@ async function sendSms(to, body, context) {
       hasAuthToken: Boolean(process.env.TWILIO_AUTH_TOKEN),
       hasFrom: Boolean(process.env.TWILIO_PHONE_NUMBER),
     });
-    return;
+    return false;
   }
 
   try {
@@ -124,26 +181,11 @@ async function sendSms(to, body, context) {
       sid: message.sid,
       to: normalizedTo,
     });
+
+    return true;
   } catch (error) {
     logTwilioError(context, error);
-    throw error;
-  }
-}
-
-async function sendProcessHitSms(from, callSid) {
-  if (!process.env.YOUR_PHONE_NUMBER) {
-    console.log("[twilio:process-hit] skipped because YOUR_PHONE_NUMBER is not set");
-    return;
-  }
-
-  try {
-    await sendSms(
-      process.env.YOUR_PHONE_NUMBER,
-      `Process hit for call ${callSid || "unknown"} from ${normalizePhoneNumber(from) || from || "unknown"}.`,
-      "process-hit",
-    );
-  } catch (error) {
-    logTwilioError("process-hit", error);
+    return false;
   }
 }
 
@@ -161,29 +203,82 @@ async function sendLeadNotifications(lead, transcript) {
     `Conversation transcript:\n${transcript}`;
 
   if (!lead.smsSentToCaller) {
-    try {
-      await sendSms(lead.phone, callerMessage, "caller-confirmation");
-      lead.smsSentToCaller = true;
-    } catch (error) {
-      logTwilioError("caller-confirmation", error);
-    }
+    lead.smsSentToCaller = await sendSms(
+      lead.phone,
+      callerMessage,
+      "caller-confirmation",
+    );
   }
 
   if (!lead.smsSentToOwner && process.env.YOUR_PHONE_NUMBER) {
-    try {
-      await sendSms(
-        process.env.YOUR_PHONE_NUMBER,
-        ownerMessage,
-        "owner-summary",
-      );
-      lead.smsSentToOwner = true;
-    } catch (error) {
-      logTwilioError("owner-summary", error);
-    }
+    lead.smsSentToOwner = await sendSms(
+      process.env.YOUR_PHONE_NUMBER,
+      ownerMessage,
+      "owner-summary",
+    );
   }
 
   lead.completed = lead.smsSentToCaller && lead.smsSentToOwner;
+
+  console.log("[sms] lead notification status", {
+    callerSent: lead.smsSentToCaller,
+    ownerSent: lead.smsSentToOwner,
+    completed: lead.completed,
+  });
+
   return lead;
+}
+
+function questionForStep(step) {
+  switch (step) {
+    case "issue":
+      return "Can you tell me what you're experiencing?";
+    case "property":
+      return "Is this a house, apartment, or commercial property?";
+    case "size":
+      return "About how large is the affected area?";
+    case "urgency":
+      return "When did you first notice this, and is it something that needs attention right away?";
+    case "close":
+      return "I can have a specialist reach out, or schedule a visit - what works best for you?";
+    case "name":
+      return "Can I get your name for the inspection?";
+    case "address":
+      return "What's the address where this is needed?";
+    default:
+      return "Can you tell me a bit more?";
+  }
+}
+
+function buildNoSpeechPrompt(step) {
+  return `I didn't catch that clearly. ${questionForStep(step)}`;
+}
+
+function isValidName(value) {
+  const words = value
+    .trim()
+    .replace(/[.,]/g, "")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  return (
+    words.length >= 1 &&
+    words.length <= 3 &&
+    words.every((word) => /^[A-Za-z'-]+$/.test(word))
+  );
+}
+
+function isValidAddress(value) {
+  return (
+    /\d/.test(value) &&
+    /(street|st|avenue|ave|road|rd|drive|dr|lane|ln|court|ct|boulevard|blvd|way|place|pl|trail|trl|circle|cir|parkway|pkwy|highway|hwy|unit|apt|suite|ste)\b/i.test(
+      value,
+    )
+  );
+}
+
+function composeReply(acknowledgement, prompt) {
+  return [acknowledgement, prompt].filter(Boolean).join(" ").trim();
 }
 
 export const config = {
@@ -213,40 +308,36 @@ export default async function handler(req, res) {
     const speechResult = (req.body?.SpeechResult || "").trim();
     const callSid = req.body?.CallSid || null;
     const from = req.body?.From || "";
-    const conversation = getConversation(callSid);
+    const state = getCallState(callSid);
     const lead = getLead(callSid, from);
     const twiml = new twilio.twiml.VoiceResponse();
 
     console.log("[process] incoming call", {
       callSid,
       from: normalizePhoneNumber(from) || from,
+      step: state.step,
       speechResult,
     });
 
-    await sendProcessHitSms(from, callSid);
-
     if (!speechResult) {
-      buildGather(
-        twiml,
-        "I didn't catch that clearly. Can you tell me what you're experiencing?",
-      );
+      buildGather(twiml, buildNoSpeechPrompt(state.step));
       twiml.redirect({ method: "POST" }, "/api/voice");
       res.setHeader("Content-Type", "text/xml");
       return res.status(200).send(twiml.toString());
     }
 
-    const lastAssistantMessage =
-      conversation.turns
-        .filter((turn) => turn.role === "assistant")
-        .at(-1)?.text || "";
     const extracted = extractLeadDetails({
       lead,
       speechResult,
-      lastAssistantMessage,
+      lastAssistantMessage: questionForStep(state.step),
     });
 
     addTurn(callSid, "user", speechResult);
-    const updatedFromExtraction = updateLead(callSid, extracted);
+
+    const updatedFromExtraction = updateLead(callSid, {
+      phone: from || lead.phone,
+      ...extracted,
+    });
 
     console.log("[lead] extracted", {
       callSid,
@@ -254,7 +345,89 @@ export default async function handler(req, res) {
       address: updatedFromExtraction.address || "",
     });
 
-    const reply = await generateReply(callSid, speechResult);
+    let nextStep = state.step;
+    let prompt = "";
+
+    switch (state.step) {
+      case "issue":
+        updateLead(callSid, { issue: speechResult });
+        nextStep = "property";
+        prompt = questionForStep(nextStep);
+        break;
+      case "property":
+        updateLead(callSid, { propertyType: speechResult });
+        nextStep = "size";
+        prompt = questionForStep(nextStep);
+        break;
+      case "size":
+        updateLead(callSid, { size: speechResult });
+        nextStep = "urgency";
+        prompt = questionForStep(nextStep);
+        break;
+      case "urgency":
+        updateLead(callSid, { urgency: speechResult });
+        nextStep = "close";
+        prompt =
+          "A typical inspection ranges between $400 and $900 depending on the scope. " +
+          questionForStep("close");
+        break;
+      case "price":
+        nextStep = "close";
+        prompt =
+          "A typical inspection ranges between $400 and $900 depending on the scope. " +
+          questionForStep("close");
+        break;
+      case "close":
+        updateLead(callSid, { closePreference: speechResult });
+        nextStep = updatedFromExtraction.name ? "address" : "name";
+        prompt = questionForStep(nextStep);
+        break;
+      case "name":
+        if (!updatedFromExtraction.name && !isValidName(speechResult)) {
+          nextStep = "name";
+          prompt = questionForStep("name");
+          break;
+        }
+
+        if (!updatedFromExtraction.name) {
+          updateLead(callSid, { name: speechResult.trim() });
+        }
+
+        nextStep = updatedFromExtraction.address ? "done" : "address";
+        prompt =
+          nextStep === "done"
+            ? "Perfect - we'll have someone reach out shortly."
+            : questionForStep("address");
+        break;
+      case "address":
+        if (!updatedFromExtraction.address && !isValidAddress(speechResult)) {
+          nextStep = "address";
+          prompt = questionForStep("address");
+          break;
+        }
+
+        if (!updatedFromExtraction.address) {
+          updateLead(callSid, { address: speechResult.trim() });
+        }
+
+        nextStep = "done";
+        prompt = "Perfect - we'll have someone reach out shortly.";
+        break;
+      case "done":
+      default:
+        nextStep = "done";
+        prompt = "Perfect - we'll have someone reach out shortly.";
+        break;
+    }
+
+    const acknowledgement =
+      nextStep === "done" ||
+      nextStep === "close" ||
+      nextStep === "name" ||
+      nextStep === "address"
+        ? ""
+        : await generateAcknowledgement(state.step, speechResult);
+    const reply = composeReply(acknowledgement, prompt);
 
     addTurn(callSid, "assistant", reply);
 
@@ -264,13 +437,12 @@ export default async function handler(req, res) {
       summary: transcript,
     });
 
-    const shouldFinish =
-      isLeadComplete(updatedLead) &&
-      /we'll have someone reach out shortly/i.test(reply);
+    setCallStep(callSid, nextStep);
 
-    if (shouldFinish) {
+    if (nextStep === "done" && isLeadComplete(updatedLead)) {
       await sendLeadNotifications(updatedLead, transcript);
       twiml.say(reply);
+      twiml.hangup();
     } else {
       buildGather(twiml, reply);
       twiml.redirect({ method: "POST" }, "/api/voice");
