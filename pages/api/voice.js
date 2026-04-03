@@ -21,7 +21,7 @@ export default function handler(req, res) {
 
   buildGather(
     twiml,
-    "Thanks for calling Inside Diagnostics. What seems to be the issue?",
+    "Thanks for calling Inside Diagnostics. Can you tell me what you're experiencing?",
   );
   twiml.redirect({ method: "POST" }, "/api/voice");
 
